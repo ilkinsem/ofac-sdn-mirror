@@ -1,0 +1,45 @@
+name: mirror-ofac-sdn
+
+on:
+  schedule:
+    - cron: "17 6 * * *" # quotidien 06:17 UTC (OFAC publie en journée US)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Télécharger la liste SDN officielle (suit la redirection S3)
+        run: |
+          curl -fsSL --max-time 300 -o sdn_new.xml \
+            "https://sanctionslistservice.ofac.treas.gov/api/PublicationPreview/exports/SDN.XML"
+
+      - name: Sanity checks fail-closed (jamais publier un fichier douteux)
+        run: |
+          head -c 200 sdn_new.xml | grep -q "<sdnList" || { echo "::error::format inattendu (pas <sdnList>)"; exit 1; }
+          grep -q "Record_Count" sdn_new.xml || { echo "::error::Record_Count absent (fichier tronqué ?)"; exit 1; }
+          SIZE=$(stat -c%s sdn_new.xml)
+          [ "$SIZE" -gt 10000000 ] || { echo "::error::taille suspecte ($SIZE octets)"; exit 1; }
+          echo "OK : $SIZE octets"
+
+      - name: Publier si changé (historique maintenu à 1 commit)
+        run: |
+          if cmp -s sdn_new.xml sdn.xml; then
+            echo "inchangé — rien à publier"
+            exit 0
+          fi
+          mv sdn_new.xml sdn.xml
+          sha256sum sdn.xml | cut -d" " -f1 > sdn.xml.sha256
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > last_updated.txt
+          git config user.name "ofac-mirror-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add sdn.xml sdn.xml.sha256 last_updated.txt
+          git commit --amend -m "mirror: sdn.xml $(cat last_updated.txt) sha256=$(cat sdn.xml.sha256)"
+          git push --force
